@@ -9,8 +9,15 @@
  *  is returned, the command will not execute. The hash function used is a modified from DJB2.
 */
 
+#include <EEPROM.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
+
+// EEPROM details
+#define EEPROM_SIZE 256
+#define MAX_STRING_LENGTH 64 // includes null terminator
+#define FLAG_ADDRESS (EEPROM_SIZE - 1)
+#define INIT_FLAG 0x2D // used to determine if values have been stored
 
 // Preprocessor directives for hash function
 #define SEED 5381   // seed value
@@ -24,16 +31,16 @@
 // Wi-Fi access point details
 const char *portalName = "Door Lock Config";
 
-// MQTT server details
-#define MQTT_SERVER_MAX_LENGTH 64
-#define MQTT_USER_MAX_LENGTH 15
-#define MQTT_PASSWORD_MAX_LENGTH 20
+// EEPROM locations for MQTT server parameters
+#define MQTT_SERVER_START 0
+#define MQTT_USER_START (MQTT_SERVER_START + MAX_STRING_LENGTH)
+#define MQTT_PASSWORD_START (MQTT_USER_START + MAX_STRING_LENGTH)
 
-char mqttServer[MQTT_SERVER_MAX_LENGTH];
-int mqttPort = 50000;
-char mqttUser[];
-char *mqttPassword = "DoorLock1";
-char mqttDeviceName = "DoorLock";
+// MQTT server details
+char mqttServer[MAX_STRING_LENGTH];
+const int mqttPort = 50000; // not configurable at this time
+char mqttUser[MAX_STRING_LENGTH];
+char mqttPassword[MAX_STRING_LENGTH];
 
 // Topics
 const char *topicCommands = "commands";
@@ -49,6 +56,40 @@ int userNumber = -1;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// Initialize EEPROM
+void initEEPROM() {
+  EEPROM.begin(EEPROM_SIZE);
+  if (EEPROM.read(FLAG_ADDRESS) != INIT_FLAG) {
+    for (int i = 0; i < EEPROM_SIZE; i++) {
+      EEPROM.write(i, '\0');
+    }
+    EEPROM.write(FLAG_ADDRESS, INIT_FLAG);
+    EEPROM.commit();
+  }
+  EEPROM.end();
+}
+
+// Get a parameter in EEPROM using output parameter
+void getSavedString(int start, char *buffer) {
+  EEPROM.begin(EEPROM_SIZE);
+  for (int i = 0; i < MAX_STRING_LENGTH; i++) {
+    buffer[i] = EEPROM.read(start + i);
+    if (buffer[i] == '\0') break; // stop at null terminator
+  }
+  EEPROM.end();
+}
+
+// Set a parameter in EEPROM
+void setSavedString(int start, char *value) {
+  EEPROM.begin(EEPROM_SIZE);
+  for (int i = 0; i < MAX_STRING_LENGTH; i++) {
+    EEPROM.write(start + i, value[i]);
+    if (value[i] == '\0') break; // stop at null terminator
+  }
+  EEPROM.commit(); // save changes
+  EEPROM.end();
+}
+
 // Generate a random 8-character string
 String generateRandomString() {
   String result = "";
@@ -60,7 +101,7 @@ String generateRandomString() {
 }
 
 // Modified DJB2 hash function
-String calculateHash(const String& input) {
+String djb2Modified(const String& input) {
   uint64_t hash = SEED;
   for (char c : input) {
     hash = (hash * 33) + c;
@@ -90,6 +131,7 @@ void executeCommand() {
   } else {
     Serial.println("Unknown command, nothing to execute.");
   }
+  Serial.println();
 }
 
 // MQTT callback function
@@ -98,7 +140,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
-  Serial.printf("Message arrived on topic: %s. Message: %s\n", topic, message.c_str());
+  Serial.printf("\nMessage arrived on topic: %s. Message: %s\n", topic, message.c_str());
 
   if (String(topic) == topicCommands) {
     // Parse the command
@@ -110,9 +152,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         Serial.printf("Valid command received: User %d, Command %s\n", userNumber, lastCommand.c_str());
         // Generate a random string and hash
         String randomString = generateRandomString();
-        lastHash = calculateHash(randomString);
-        client.publish(topicValidationRequests, randomString.c_str());
-        Serial.printf("Validation request sent: %s\n", randomString.c_str());
+        lastHash = djb2Modified(randomString);
+        String payload = String(userNumber) + randomString;
+        client.publish(topicValidationRequests, payload.c_str());
+        Serial.printf("Validation request sent to user %d: %s\n", userNumber, payload.c_str());
       } else {
         Serial.println("Invalid command received.");
       }
@@ -126,7 +169,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println("Hash matched, executing command.");
       executeCommand();
     } else {
-      Serial.println("Hash mismatch, command not executed.");
+      Serial.println("Hash mismatch, command not executed.\n");
     }
   }
 }
@@ -141,23 +184,62 @@ void setup() {
   delay(100);
   Serial.println("########## MQTT Door Lock System --- Kyle Smith & Ryan Januszko ##########");
 
+  // Initialize EEPROM if no values are stored
+  initEEPROM();
+
+  // Get existing parameters from EEPROM (may be empty)
+  getSavedString(MQTT_SERVER_START, mqttServer);
+  getSavedString(MQTT_USER_START, mqttUser);
+  getSavedString(MQTT_PASSWORD_START, mqttPassword);
+
+  bool anyParamNotSet = strlen(mqttServer) == 0 || strlen(mqttUser) == 0 || strlen(mqttUser) == 0;
+
   // Initialize Wi-Fi via WiFiManager
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
 
   // Open configuration if button is held
-  if (digitalRead(BTN_WIFI_RES) == LOW) {
-    Serial.println("User requested to open configuration portal");
-    wm.startConfigPortal(portalName);
-  } else {
-    bool res;
-    Serial.println("Attempting to connect to WiFi...");
-    res = wm.autoConnect(portalName);
+  if (digitalRead(BTN_WIFI_RES) == LOW || anyParamNotSet) {
+    Serial.println(anyParamNotSet ? "MQTT Server parameters not set, opening configuration portal" : "User requested to open configuration portal");
 
-    if (!res) {
-      Serial.println("Failed to connect to WiFi. Going to sleep. Reboot device.");
-      esp_deep_sleep_start();
-    }
+    // Create custom parameters (will only show up if configure portal is opened for this purpose)
+    char *tempMqttServer = mqttServer;
+    char *tempMqttUser = mqttUser;
+    char *tempMqttPassword = mqttPassword;
+    WiFiManagerParameter mqttServerParam("mqttServer", "MQTT Server", tempMqttServer, MAX_STRING_LENGTH);
+    WiFiManagerParameter mqttUserParam("mqttUser", "MQTT User", tempMqttUser, MAX_STRING_LENGTH);
+    WiFiManagerParameter mqttPasswordParam("mqttPassword", "MQTT Password", tempMqttPassword, MAX_STRING_LENGTH);
+    wm.addParameter(&mqttServerParam);
+    wm.addParameter(&mqttUserParam);
+    wm.addParameter(&mqttPasswordParam);
+
+    wm.startConfigPortal(portalName);
+    Serial.println("Configuration portal closed");
+
+    // Save parameters
+    strncpy(mqttServer, mqttServerParam.getValue(), MAX_STRING_LENGTH);
+    strncpy(mqttUser, mqttUserParam.getValue(), MAX_STRING_LENGTH);
+    strncpy(mqttPassword, mqttPasswordParam.getValue(), MAX_STRING_LENGTH);
+    Serial.printf("New MQTT credentials from configuration portal:\nServer: <%s>\nUser: <%s>\nPassword: <%s>\nSaving to EEPROM\n", mqttServer, mqttUser, mqttPassword);
+    setSavedString(MQTT_SERVER_START, mqttServer);
+    setSavedString(MQTT_USER_START, mqttUser);
+    setSavedString(MQTT_PASSWORD_START, mqttPassword);
+  }
+
+    Serial.println("Attempting to connect to WiFi...");
+    bool res = wm.autoConnect(portalName);
+
+  // Force manual reboot if Wi-Fi connection fails
+  if (!res) {
+      Serial.println("Failed to connect to WiFi. Restarting.");
+      ESP.restart();
+  }
+
+  // Check again for empty parameters. Force reboot if present
+  anyParamNotSet = strlen(mqttServer) == 0 || strlen(mqttUser) == 0 || strlen(mqttUser) == 0;
+  if (anyParamNotSet) {
+    Serial.println("Missing MQTT parameter. Restarting.");
+      ESP.restart();
   }
 
   // Initialize MQTT
@@ -167,7 +249,7 @@ void setup() {
   // Connect to MQTT broker
   Serial.println("Connecting to MQTT broker...");
   while (!client.connected()) {
-    if (client.connect(mqttDeviceName, mqttUser, mqttPassword)) {
+    if (client.connect(mqttUser, mqttUser, mqttPassword)) {
       Serial.println("Connected to MQTT broker");
       client.subscribe(topicCommands);
       client.subscribe(topicValidationResponses);
